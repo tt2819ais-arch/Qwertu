@@ -2,27 +2,28 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Установка минимальных зависимостей
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Установка системных зависимостей
+RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
     && rm -rf /var/lib/apt/lists/*
 
-# Сначала копируем requirements для кэширования
+# Копируем зависимости
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем основной код
+# Копируем код
 COPY bot.py .
 
-# Создаем не-root пользователя
+# Создаем папки для медиа
+RUN mkdir -p saved_media saved_media/photos saved_media/videos saved_media/voices saved_media/documents saved_media/stickers
+
+# Создаем пользователя
 RUN useradd -m -u 1000 botuser && chown -R botuser:botuser /app
 USER botuser
 
 # Переменные окружения
 ENV PYTHONUNBUFFERED=1
-ENV PYTHONPATH=/app
 
-# Команда запуска
+# Запуск
 CMD ["python", "bot.py"]
